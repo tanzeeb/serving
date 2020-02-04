@@ -84,9 +84,13 @@ func dial(host, domain string) (*grpc.ClientConn, error) {
 func unaryTest(t *testing.T, resources *v1a1test.ResourceObjects, clients *test.Clients, names test.ResourceNames, host, domain string) {
 	t.Helper()
 	t.Logf("Connecting to grpc-ping using host %q and authority %q", host, domain)
-	const msg = "Hello!"
-	if err := pingGRPC(host, domain, msg); err != nil {
+	const want = "Hello!"
+	got, err := pingGRPC(host, domain, want)
+	if err != nil {
 		t.Fatalf("gRPC ping = %v", err)
+	}
+	if got != want {
+		t.Fatalf("response = %q, want = %q", got, want)
 	}
 }
 
@@ -122,11 +126,11 @@ func loadBalancingTest(t *testing.T, resources *v1a1test.ResourceObjects, client
 
 	var (
 		wantHosts   = 3
-		msgPrefix   = "hello-"
+		wantPrefix  = "hello-"
 		uniqueHosts sync.Map
 		stopChan    = make(chan struct{})
-		timeout     = time.NewTimer(60 * time.Second)
-		clock       = time.NewTicker(1 * time.Second)
+		done        = time.After(60 * time.Second)
+		timer       = time.Tick(1 * time.Second)
 	)
 
 	countKeys := func(m sync.Map) int {
@@ -146,26 +150,17 @@ func loadBalancingTest(t *testing.T, resources *v1a1test.ResourceObjects, client
 					return nil
 				default:
 					err := func() error {
-						conn, err := dial(host, domain)
+						got, err := pingGRPC(host, domain, wantPrefix)
 						if err != nil {
-							return err
+							return fmt.Errorf("ping gRPC error: %v", err)
 						}
-						defer conn.Close()
-
-						pc := ping.NewPingServiceClient(conn)
-						want := &ping.Request{Msg: msgPrefix}
-
-						got, err := pc.Ping(context.Background(), want)
-						if err != nil {
-							return fmt.Errorf("could not send request: %v", err)
+						if !strings.HasPrefix(got, wantPrefix) {
+							return fmt.Errorf("response = %q, wantPrefix = %q", got, wantPrefix)
 						}
 
-						if !strings.HasPrefix(got.Msg, msgPrefix) {
-							return fmt.Errorf("response = %q, wantPrefix = %q", got.Msg, msgPrefix)
+						if host := strings.TrimPrefix(got, wantPrefix); host != "" {
+							uniqueHosts.Store(host, true)
 						}
-
-						host := strings.TrimPrefix(got.Msg, msgPrefix)
-						uniqueHosts.Store(host, true)
 						return nil
 					}()
 					if err != nil {
@@ -178,29 +173,26 @@ func loadBalancingTest(t *testing.T, resources *v1a1test.ResourceObjects, client
 	}
 
 	grp.Go(func() error {
+		defer close(stopChan)
 		for {
 			select {
-			case <-timeout.C:
-				close(stopChan)
-				gotHosts := countKeys(uniqueHosts)
-				if gotHosts < wantHosts {
-					return fmt.Errorf("Want %d hosts, got %d hosts", wantHosts, gotHosts)
-				} else {
-					return nil
-				}
-			case <-clock.C:
+			case <-done:
+				return nil
+			case <-timer:
 				if countKeys(uniqueHosts) >= wantHosts {
-					close(stopChan)
 					return nil
 				}
-				// TODO: another case: how to exit quicker if there is any error in first set of goroutines
 			}
 		}
 	})
 
 	if err := grp.Wait(); err != nil {
-		defer clock.Stop()
 		ctx.t.Fatalf("error load balancing requests %v", err)
+	}
+
+	gotHosts := countKeys(uniqueHosts)
+	if gotHosts < wantHosts {
+		ctx.t.Fatalf("Wanted %d hosts, got %d hosts", wantHosts, gotHosts)
 	}
 }
 
@@ -215,9 +207,14 @@ func generateGRPCTraffic(concurrentRequests int, host, domain string, stopChan c
 				case <-stopChan:
 					return nil
 				default:
-					msg := fmt.Sprintf("Hello! stream:%d request: %d", i, j)
-					if err := pingGRPC(host, domain, msg); err != nil {
-						return err
+					want := fmt.Sprintf("Hello! stream:%d request: %d", i, j)
+					got, err := pingGRPC(host, domain, want)
+
+					if err != nil {
+						return fmt.Errorf("ping gRPC error: %v", err)
+					}
+					if got != want {
+						return fmt.Errorf("response = %q, want = %q", got, want)
 					}
 				}
 			}
@@ -230,10 +227,10 @@ func generateGRPCTraffic(concurrentRequests int, host, domain string, stopChan c
 	return nil
 }
 
-func pingGRPC(host, domain, message string) error {
+func pingGRPC(host, domain, message string) (string, error) {
 	conn, err := dial(host, domain)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer conn.Close()
 
@@ -242,13 +239,9 @@ func pingGRPC(host, domain, message string) error {
 
 	got, err := pc.Ping(context.Background(), want)
 	if err != nil {
-		return fmt.Errorf("could not send request: %v", err)
+		return "", fmt.Errorf("could not send request: %v", err)
 	}
-
-	if got.Msg != want.Msg {
-		return fmt.Errorf("response = %q, want = %q", got.Msg, want.Msg)
-	}
-	return nil
+	return got.Msg, nil
 }
 
 func assertGRPCAutoscaleUpToNumPods(ctx *testContext, curPods, targetPods float64, duration time.Duration, host, domain string) {
