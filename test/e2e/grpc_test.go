@@ -25,6 +25,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,6 +104,96 @@ func autoscaleTest(t *testing.T, resources *v1a1test.ResourceObjects, clients *t
 	assertGRPCAutoscaleUpToNumPods(ctx, 1, 2, 60*time.Second, host, domain)
 	assertScaleDown(ctx)
 	assertGRPCAutoscaleUpToNumPods(ctx, 0, 2, 60*time.Second, host, domain)
+}
+
+func loadBalancingTest(t *testing.T, resources *v1a1test.ResourceObjects, clients *test.Clients, names test.ResourceNames, host, domain string) {
+	t.Helper()
+	t.Logf("Connecting to grpc-ping using host %q and authority %q", host, domain)
+
+	ctx := &testContext{
+		t:                 t,
+		clients:           clients,
+		resources:         resources,
+		names:             names,
+		targetUtilization: targetUtilization,
+	}
+
+	var grp errgroup.Group
+	var stopChan = make(chan interface{})
+
+	var hosts sync.Map
+
+	wantHosts := 3
+
+	countKeys := func(m sync.Map) int {
+		count := 0
+		hosts.Range(func(k, v interface{}) bool {
+			count++
+			return true
+		})
+		return count
+	}
+
+	for i := 0; i < wantHosts; i++ {
+		grp.Go(func() error {
+			for {
+				select {
+				case <-stopChan:
+					return nil
+				default:
+					return func() error {
+						msg := "hello-"
+
+						conn, err := dial(host, domain)
+						if err != nil {
+							return err
+						}
+						defer conn.Close()
+
+						pc := ping.NewPingServiceClient(conn)
+						want := &ping.Request{Msg: msg}
+
+						got, err := pc.Ping(context.Background(), want)
+						if err != nil {
+							return fmt.Errorf("could not send request: %v", err)
+						}
+
+						host = strings.TrimPrefix(got.Msg, want.Msg)
+						hosts.Store(host, true)
+
+						return nil
+					}()
+				}
+			}
+			return nil
+		})
+	}
+
+	grp.Go(func() error {
+		timeout := time.NewTimer(60 * time.Second)
+		clock := time.NewTimer(1 * time.Second)
+		for {
+			select {
+			case <-timeout.C:
+				close(stopChan)
+				gotHosts := countKeys(hosts)
+				if gotHosts < wantHosts {
+					return fmt.Errorf("Want %d hosts, got %d hosts", wantHosts, gotHosts)
+				} else {
+					return nil
+				}
+			case <-clock.C:
+				if countKeys(hosts) >= wantHosts {
+					close(stopChan)
+					return nil
+				}
+			}
+		}
+	})
+
+	if err := grp.Wait(); err != nil {
+		ctx.t.Fatalf("error load balancing requests %v", err)
+	}
 }
 
 func generateGRPCTraffic(concurrentRequests int, host, domain string, stopChan chan struct{}) error {
@@ -332,6 +423,22 @@ func TestGRPCAutoscaleUpDownUp(t *testing.T) {
 		rtesting.WithEnv(corev1.EnvVar{
 			Name:  "DELAY",
 			Value: "500",
+		}),
+	)
+}
+
+func TestGRPCLoadBalancing(t *testing.T) {
+	testGRPC(t,
+		func(t *testing.T, resources *v1a1test.ResourceObjects, clients *test.Clients, names test.ResourceNames, host, domain string) {
+			loadBalancingTest(t, resources, clients, names, host, domain)
+		},
+		rtesting.WithConfigAnnotations(map[string]string{
+			autoscaling.TargetAnnotationKey:   strconv.FormatFloat(grpcContainerConcurrency, 'f', -1, 64),
+			autoscaling.MinScaleAnnotationKey: "3",
+		}),
+		rtesting.WithEnv(corev1.EnvVar{
+			Name:  "HOSTNAME",
+			Value: "true",
 		}),
 	)
 }

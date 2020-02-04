@@ -30,9 +30,10 @@ import (
 )
 
 var delay int64
+var hostname string
 
 func pong(req *ping.Request) *ping.Response {
-	return &ping.Response{Msg: req.Msg + os.Getenv("SUFFIX")}
+	return &ping.Response{Msg: req.Msg + hostname + os.Getenv("SUFFIX")}
 }
 
 type server struct{}
@@ -89,6 +90,10 @@ func main() {
 
 	delay, _ = strconv.ParseInt(os.Getenv("DELAY"), 10, 64)
 	log.Printf("Using DELAY of %d ms", delay)
+
+	if wantHostname, _ := strconv.ParseBool(os.Getenv("HOSTNAME")); wantHostname {
+		hostname, _ = os.Hostname()
+	}
 
 	g := grpc.NewServer()
 	s := network.NewServer(":"+os.Getenv("PORT"), httpWrapper(g))
