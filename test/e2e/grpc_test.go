@@ -119,15 +119,19 @@ func loadBalancingTest(t *testing.T, resources *v1a1test.ResourceObjects, client
 	}
 
 	var grp errgroup.Group
-	var stopChan = make(chan interface{})
 
-	var hosts sync.Map
-
-	wantHosts := 3
+	var (
+		wantHosts   = 3
+		msgPrefix   = "hello-"
+		uniqueHosts sync.Map
+		stopChan    = make(chan struct{})
+		timeout     = time.NewTimer(60 * time.Second)
+		clock       = time.NewTicker(1 * time.Second)
+	)
 
 	countKeys := func(m sync.Map) int {
 		count := 0
-		hosts.Range(func(k, v interface{}) bool {
+		uniqueHosts.Range(func(k, v interface{}) bool {
 			count++
 			return true
 		})
@@ -141,9 +145,7 @@ func loadBalancingTest(t *testing.T, resources *v1a1test.ResourceObjects, client
 				case <-stopChan:
 					return nil
 				default:
-					return func() error {
-						msg := "hello-"
-
+					err := func() error {
 						conn, err := dial(host, domain)
 						if err != nil {
 							return err
@@ -151,18 +153,24 @@ func loadBalancingTest(t *testing.T, resources *v1a1test.ResourceObjects, client
 						defer conn.Close()
 
 						pc := ping.NewPingServiceClient(conn)
-						want := &ping.Request{Msg: msg}
+						want := &ping.Request{Msg: msgPrefix}
 
 						got, err := pc.Ping(context.Background(), want)
 						if err != nil {
 							return fmt.Errorf("could not send request: %v", err)
 						}
 
-						host = strings.TrimPrefix(got.Msg, want.Msg)
-						hosts.Store(host, true)
+						if !strings.HasPrefix(got.Msg, msgPrefix) {
+							return fmt.Errorf("response = %q, wantPrefix = %q", got.Msg, msgPrefix)
+						}
 
+						host := strings.TrimPrefix(got.Msg, msgPrefix)
+						uniqueHosts.Store(host, true)
 						return nil
 					}()
+					if err != nil {
+						return err
+					}
 				}
 			}
 			return nil
@@ -170,28 +178,28 @@ func loadBalancingTest(t *testing.T, resources *v1a1test.ResourceObjects, client
 	}
 
 	grp.Go(func() error {
-		timeout := time.NewTimer(60 * time.Second)
-		clock := time.NewTimer(1 * time.Second)
 		for {
 			select {
 			case <-timeout.C:
 				close(stopChan)
-				gotHosts := countKeys(hosts)
+				gotHosts := countKeys(uniqueHosts)
 				if gotHosts < wantHosts {
 					return fmt.Errorf("Want %d hosts, got %d hosts", wantHosts, gotHosts)
 				} else {
 					return nil
 				}
 			case <-clock.C:
-				if countKeys(hosts) >= wantHosts {
+				if countKeys(uniqueHosts) >= wantHosts {
 					close(stopChan)
 					return nil
 				}
+				// TODO: another case: how to exit quicker if there is any error in first set of goroutines
 			}
 		}
 	})
 
 	if err := grp.Wait(); err != nil {
+		defer clock.Stop()
 		ctx.t.Fatalf("error load balancing requests %v", err)
 	}
 }
@@ -433,8 +441,10 @@ func TestGRPCLoadBalancing(t *testing.T) {
 			loadBalancingTest(t, resources, clients, names, host, domain)
 		},
 		rtesting.WithConfigAnnotations(map[string]string{
-			autoscaling.TargetAnnotationKey:   strconv.FormatFloat(grpcContainerConcurrency, 'f', -1, 64),
-			autoscaling.MinScaleAnnotationKey: "3",
+			autoscaling.TargetUtilizationPercentageKey: strconv.FormatFloat(targetUtilization*100, 'f', -1, 64),
+			autoscaling.TargetAnnotationKey:            strconv.FormatFloat(grpcContainerConcurrency, 'f', -1, 64),
+			autoscaling.MinScaleAnnotationKey:          "3",
+			autoscaling.TargetBurstCapacityKey:         strconv.FormatFloat(-1, 'f', -1, 64),
 		}),
 		rtesting.WithEnv(corev1.EnvVar{
 			Name:  "HOSTNAME",

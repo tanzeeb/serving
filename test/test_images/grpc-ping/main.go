@@ -93,6 +93,7 @@ func main() {
 
 	if wantHostname, _ := strconv.ParseBool(os.Getenv("HOSTNAME")); wantHostname {
 		hostname, _ = os.Hostname()
+		log.Printf("Setting hostname in response %s", hostname)
 	}
 
 	g := grpc.NewServer()
